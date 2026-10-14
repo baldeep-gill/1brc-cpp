@@ -1,6 +1,7 @@
 #ifndef OBRC_USERNAME_HPP
 #define OBRC_USERNAME_HPP
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/mman.h>
@@ -20,29 +22,64 @@
 #include <fcntl.h>
 #include <memory>
 
-constexpr std::size_t CHUNK_SIZE = 512 * 1024 * 1024;
+#include <mutex>
+#include <condition_variable>
+#include <optional>
+
+constexpr std::size_t CHUNK_SIZE = 1024 * 1024 * 1024;
 
 using StationID = std::uint16_t;
 using Temperature = std::int32_t;
 
+struct Chunk { 
+    char* data = nullptr;
+    size_t size;
+    std::uint64_t offset;
+};
+
 class BufferedReader {
     private:
-        char* buffer_;
+        char* buffers[2] = {nullptr, nullptr};
+        bool active[2] = {false, false};
         std::string overflow_;
-        FILE* file_;
+        int fd;
+        size_t filesize_;
+        size_t offset_;
+        bool finished_ = false;
+        std::size_t active_buffer = 0;
+        
+        std::mutex mtx_;
+        std::condition_variable cv_producer;
             
     public:
-        BufferedReader(std::string_view filename) : buffer_(new char[CHUNK_SIZE]), file_(fopen(filename.data(), "rb")) {
-            if (file_ == NULL) std::terminate();
+        char* current_ = nullptr;
+        bool ready = false;
+        
+        BufferedReader(std::string_view filename) : fd(open(filename.data(), O_RDONLY)), offset_(0) {
+            filesize_ = lseek(fd, 0, SEEK_END);
+            lseek(fd, 0, SEEK_SET);
+
+            buffers[0] = static_cast<char*>(mmap(nullptr, CHUNK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            buffers[1] = static_cast<char*>(mmap(nullptr, CHUNK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         };
 
-        char* read(size_t& bytes_read) {
-            bytes_read = std::fread(buffer_, 1, CHUNK_SIZE, file_);
-            
-            return buffer_;
-            // char* of = std::strrchr(buffer_, '\n');
-            // if (of == NULL) std::cout << "null\n";
-            // else std::cout << "notnull\n" << of << "\n";
+        std::optional<Chunk> produce_next() {
+            char* buffer{};
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+
+                cv_producer.wait(lock, [this] {
+                    return finished_ || !active[1 - active_buffer]; 
+                });
+            }
+
+            std::size_t index = 1 - active_buffer;
+            buffer = buffers[index];
+            active[index] = true;
+
+            void* m = static_cast<char*>(
+                mmap(buffer, CHUNK_SIZE, PROT_READ, MAP_PRIVATE, fd, offset_)
+            );
         }
 };
 
@@ -85,15 +122,16 @@ std::string temptos(const Temperature& temperature) {
            std::to_string(magnitude % 10);
 }
 
+struct Measurement {
+    std::int64_t sum = 0;
+    size_t count = 0;
+    Temperature min = std::numeric_limits<Temperature>::max();
+    Temperature max = std::numeric_limits<Temperature>::min();
+};
+
+
 // Don't change signature of this function, feel free to change everything else
-inline void solution(const std::string& filename) {
-    struct Measurement {
-        std::int64_t sum = 0;
-        size_t count = 0;
-        Temperature min = std::numeric_limits<Temperature>::max();
-        Temperature max = std::numeric_limits<Temperature>::min();
-    };
-    
+inline void solution(const std::string& filename) {    
     std::unordered_map<std::string, StationID> name_lookup{};
     std::unordered_map<StationID, Measurement> station_data{};
 
@@ -163,6 +201,7 @@ inline void solution(const std::string& filename) {
         delete station_name;
         delete temp_str;
     }
+  
 
     munmap(mapped, filesize);
     close(fd);
